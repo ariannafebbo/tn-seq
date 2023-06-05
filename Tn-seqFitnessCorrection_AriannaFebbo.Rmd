@@ -1,0 +1,696 @@
+---
+title: "Tn-seq fitness correction in Streptococcus pneumoniae genome"
+author: "Arianna Febbo"
+date: "20/05/2022"
+output:
+      rmdformats::readthedown:
+      self_contained: true
+      df_print: paged
+      highlight: tango
+      lightbox: true
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+options(max.print=10000)
+```
+
+```{r, wd, echo=FALSE}
+setwd("C:/Users/arianna.febbo/Desktop/Bioinformatics for computational genomics/ADV. Genomics/TNseq_correction_exam")
+```
+
+# Introduction
+
+Tn-seq is a technique that employs high-throughput sequencing to investigate quantitative genetic interactions in microorganisms. Essentially, the method involves generating a comprehensive transposon insertion library and then sequencing all flanking regions of the transposon mutants together rather than individually. As such, it allows for quick determination of changes in frequency associated with each mutant leading to fitness calculation value for every gene within a genome. 
+
+The project will be analyzing Streptococcus pneumoniae genome, which is a causative agent of pneumonia and meningitis. The data was taken from [Van Opijnen et al., 2009](https://www.nature.com/articles/nmeth.1377).
+
+The aim of th project is to correct the fitness values that seem to be higher at the extremity of the linearized chromosome, as visible in the scatter plot in [Section 2.1](#section2.1), i.e. correcting the bias introduced by the active replication of the chromosome.
+
+## Computational cost
+
+The analysis runs on a computer with 8 GB of RAM and Ryzen PRO 5 CPU in one minute.
+
+## Libraries
+
+Loading the libraries required in this Notebook:
+```{r libraries, message=FALSE, warning=FALSE}
+library("GenomicRanges")
+library("ggplot2")
+library("dplyr")
+library("gridExtra")
+```
+
+# Single-cell RNA sequencing
+
+## Data loading & Pre-processing {#section2.1}
+
+Let's load the fitness data and the genomic coordinates.
+
+```{r preprocessing}
+fitnessData<-read.delim("Tn_seq_fitness_data_Opijnen_et_al_2009.txt",header=TRUE,stringsAsFactors = FALSE,sep = "\t")
+geneCoord<-read.delim("GCF_000006885.1_ASM688v1_genomic_olt.txt",header=FALSE,stringsAsFactors = FALSE,sep = "\t")
+colnames(geneCoord)[1:3] <- c("locus", "start", "stop")
+
+head(fitnessData) #showing first rows of fitnessData
+head(geneCoord) #showing first rows of geneCoord
+```
+
+Let's visualize the distribution and density of data point of "Avg. Fitness" values of genes vs. "Genome location". The majority of data point have "Avg. Fitness" value included between 0.96 and 1.04. We can observe the tendency of point at the extremity of the chromosome to have higher fitness values.
+
+```{r visualizing fitness vs genome location2, warning=FALSE, message=FALSE}
+data <- data.frame(
+  x = (geneCoord$start[fitnessData$average_fitness != 0] + geneCoord$stop[fitnessData$average_fitness != 0]) / 2,
+  y = fitnessData$average_fitness[fitnessData$average_fitness != 0]
+)
+
+color_categories <- cut(data$y, breaks = c(0, 0.96, 1.04, Inf), labels = c("Disadvantageous", "Neutral", "Advantageous"))
+color_palette <- c("red", "yellow", "green")
+
+ggplot(data, aes(x = x, y = y, color = color_categories)) +
+  geom_point(size = 1) +
+  geom_smooth(method = "density") +
+    geom_smooth(color='black')+
+  scale_color_manual(values = color_palette,
+                     labels = c("Disadvantageous", "Neutral", "Advantageous"),
+                     guide = guide_legend(title = "Fitness Category")) +
+  labs(
+    x = "Genomic coordinates",
+    y = "Avg gene fitness",
+    title = "Fitness vs Genome location"
+  ) +
+  scale_y_continuous(breaks = c(0, 0.5, 0.7, 0.9, 0.96, 1.04, 1.1)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.background = element_blank()
+  )
+```
+
+Genes having avarage gene fitness = 0 where taken out of the graph. 
+
+The 2 dataframes are merged into 1 by inner join, combining the rows of the two dataframes based on matching values in the common "locus" column. The 2 dataframes share 1813 loci. Then, the object is converted to a GRanges object.
+
+```{r merging datasets}
+mergedData <- merge(fitnessData, geneCoord, by = "locus")
+head(mergedData)
+fitness <- GRanges(seqnames = Rle("chr", nrow(mergedData)),
+                      ranges = IRanges(start=mergedData$start,
+                                       end=mergedData$stop,
+                                       names=mergedData$locus),
+                      avg_fitness = mergedData$average_fitness)
+head(fitness)
+```
+
+The genes according to fitness values thresholds in [Van Opijnen et al., 2009](https://www.nature.com/articles/nmeth.1377) are divided in 3 categories, as follows: 
+
+* Neutral (fitness = 0.96–1.04);
+* Advantageous (fitness > 1.04);
+* Disadvantageous (fitness < 0.96).
+
+So, it's interesting to add this information to the metadata slot of the Granges object, that can be customized, as done with `avg_fitness` information. We will take out the once with `avg_fitness` = 0 categorized as 'possible essential'.
+
+```{r gene category}
+fitness<- fitness[fitness$avg_fitness != 0]
+
+# Define the fitness thresholds for different gene categories
+fitness_thresholds <- c(0, 0.96, 1.04, Inf)
+fitness_categories <- c('Disadvantageous', 'Neutral', 'Advantageous')
+
+# Add the category information to the metadata column
+fitness$geneCategory <- cut(fitness$avg_fitness,
+                            breaks = fitness_thresholds,
+                            labels = fitness_categories,
+                           )
+```
+
+
+As stated in the introductory section, the circular genome under analysis displays the characteristic wherein positions 1 and length of the genome are effectively connected. This feature causes the scatterplot illustrated earlier to exhibit a banana-shaped curve where fitness values tend to be higher at both ends of the graph. The reason behind this phenomenon is that genomic regions situated closer to the origin of replication display an elevated frequency of copies as compared to those located farther away from it.
+To rectify this observation, it becomes necessary to implement a model outlining how position on the genome affects fitness value.
+
+Two new variables will be added to the metadata slot:
+
+* middleCoord, the coordinate position in the middle of a locus;
+* radianCoord, the middle coordinate turned in radian.
+
+```{r middle and radian coordinates}
+fitness$middleCoord <- round((end(fitness)+start(fitness))/2) #middle coordinate position
+
+genomeLength <- max(end(fitness))
+fitness$radianCoord <- fitness$middleCoord*2*pi/genomeLength #middle coordinates in radians
+
+head(fitness@elementMetadata)
+```
+
+
+# Linear regression
+
+A technique that can be used to correct fitness measures involves dividing the genome into segments and employing the mean values within those segments as Y and the genomic location of the midpoint of each segment as X in a **linear regression model**. 
+
+## Linear coordinates 
+
+After dividing the genome into windows of default size 100000, the new dataframe containes: 
+
+* `middle_coordinate`: the genome position of the middle of the window;
+* `radians`: the `middle_coordinate` converted into radians;
+* `avg_fitness`: the average values of fitness within windows.
+
+```{r linear coordinates}
+windowProperties <- function(GrangeObj, windowSize = 100000) {
+  # Get the start and end coordinates of the genomic regions
+  start_coords <- start(GrangeObj)
+  end_coords <- end(GrangeObj)
+
+  genome_length <- max(end_coords) #calculate genome length as highest values among the one retrieved with end function
+  num_windows <- ceiling(genome_length / windowSize) #calculate the number of windows, rounding up to the next integer
+  
+  # Initialize numeric vectors to store the window statistics
+  window_coordinates <- numeric(num_windows)
+  window_radians <- numeric(num_windows)
+  window_avg_fitness <- numeric(num_windows)
+  
+  # Assigning to offset the minimum start coordinate of the genomic regions 
+  offset <- min(start_coords)
+  
+  # Iterate over the windows
+  for (i in 1:num_windows) {
+    # Define window start and end coordinates
+    window_start <- (i - 1) * windowSize + offset
+    window_end <- i * windowSize + offset - 1
+    
+    # Find the indices of genomic regions within the window
+    indices <- which(start_coords <= window_end & end_coords >= window_start)
+    
+    # Check if any regions overlap with the window
+    if (length(indices) > 0) {
+      # Compute the middle coordinate and average fitness for the window
+      window_coordinates[i] <- round((window_end + window_start) / 2)
+      window_radians[i] <- window_coordinates[i] * 2 * pi / genome_length
+      window_avg_fitness[i] <- mean(GrangeObj$avg_fitness[indices])
+    }
+  }
+  
+  # Create a dataframe with the window statistics
+  df <- data.frame(middle_coordinate = window_coordinates,
+                   radians = window_radians,
+                   avg_fitness = window_avg_fitness)
+  
+  return(df)
+}
+
+windows_properties<- windowProperties(fitness)
+windows_properties
+```
+
+Let's consider just one half of the genome divided in windows to calculate the window properties and to train the model.
+
+```{r lm first half}
+midpoint <- genomeLength / 2
+midpoint
+
+# Since the midpoint is 1080413, I can split windows_properties obj in half to get the first half of the genome
+first_half <- windows_properties[1:11,]
+#training linear regression model with the first half of the genome
+lm_lin_coord <- lm(formula = avg_fitness ~ middle_coordinate, data = first_half)
+summary(lm_lin_coord)
+```
+
+The p-values are significant (alpha < 0.01)  indicating that there is strong evidence to reject the null hypothesis that the true coefficient is zero. Therefore, there is a significant relationship between the `middle_coordinate` and `avg_fitness` variables. 
+The R squared is also quite high, indicating that approximately 78% of the variance in fitness can be explained by the linear regression model.
+
+Let's also calculate the Mean Square Error for the linear regression model.
+
+```{r MSE first half }
+predicted_first_half <- predict(lm_lin_coord, first_half)
+sqr_residuals <- (first_half$avg_fitness - predicted_first_half)^2
+mse <- mean(sqr_residuals)
+mse
+```
+
+The calculated mean squared error (MSE) of 4.342459e-05 indicates that model's predictions are quite close to the actual values, with very little error.
+
+Let's consider the second half of the genome divided in windows and predict the fitness values.
+```{r lm second half, warning=FALSE}
+second_half <- windows_properties[12:22,]
+
+reversed_coordinates <- genomeLength - second_half$middle_coordinate
+
+
+predicted_second_half <- predict(lm_lin_coord, newdata = data.frame(middle_coordinate = reversed_coordinates, avg_fitness = second_half$avg_fitness))
+
+mse <- mean((predicted_second_half - second_half$avg_fitness)^2)
+
+mse
+```
+
+The MSE is still very low, demonstrating that the linear model is suitable to train both train and test data ( second half of the genome divided in windows).
+So, the linear model can be used to correct the fitness values, which look higher at the extremities of the graph in [Section 2.1](#section2.1).
+
+```{r testing}
+# Correcting fitness values for first and second half of genome
+
+# Data gets shifted by one since it's assumed that the fitness values are around 1
+first_half$corrected_fitness <- first_half$avg_fitness - predicted_first_half +1
+first_half$corrected_fitness
+second_half$corrected_fitness <- second_half$avg_fitness - predicted_second_half +1
+second_half$corrected_fitness
+ 
+#Create one dataframe containing all the genome windows
+all_windows <- rbind(first_half,second_half)
+all_windows
+```
+Let's visualize two scatterplots plotting the fitness values against the `middle_coordinate` before and after fitness correction.
+
+```{r, linear model divided in windows before and after correction, warning=FALSE, fig.width=9, fig.height=5.5, message=FALSE}
+
+# Create the scatterplot for avg_fitness
+plot_avg_fitness <- ggplot(all_windows, aes(x = middle_coordinate, y = avg_fitness)) +
+  geom_point(size = 2)  +
+  geom_smooth(method = "density") +
+    geom_smooth(color='blue') + 
+  ylim(0.9, 1.1) +  
+  labs(title = "Before fitness correction",
+       x = "middle_coordinate",
+       y = "avg_fitness")
+# Create the scatterplot for corrected_fitness
+plot_corrected_fitness <- ggplot(all_windows, aes(x = middle_coordinate, y = corrected_fitness)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "density") +
+    geom_smooth(color='blue')  + 
+  ylim(0.9, 1.1) + 
+  labs(title = "After fitness correction",
+       x = "middle_coordinate",
+       y = "corrected_fitness")
+
+# Arrange the plots side by side
+combined_plots <- grid.arrange(plot_avg_fitness, plot_corrected_fitness, ncol = 2)
+
+
+```
+
+After fitness correction, the banana shape is strongly reduced. The linear model can be now used to correct fitness on the original `fitness` object, and consequently correcting the gene category assigned, taking into account that the second half of the genome needs to be reversed.
+
+```{r, linear regression fitness grange obj}
+#first half of fitness grange obj not divided in windows
+fitness_first_half <- subsetByOverlaps(fitness, GRanges('chr', IRanges(0, genomeLength/2)))
+fitness_first_half_df <- data.frame(middle_coordinate=fitness_first_half$middleCoord,
+                                avg_fitness=fitness_first_half$avg_fitness,
+                                gene_category  = fitness_first_half$geneCategory)
+#predict corrected fitness for the first half of genome
+predicted_fitness_first_half_df <- predict(lm_lin_coord, fitness_first_half_df)
+fitness_first_half_df$corrected_fitness <- fitness_first_half_df$avg_fitness - predicted_fitness_first_half_df + 1
+
+#second half of fitness grange obj not divided in windows
+fitness_second_half <- subsetByOverlaps(fitness, GRanges('chr', IRanges(genomeLength/2, genomeLength)))
+fitness_second_half_df <- data.frame(middle_coordinate= fitness_second_half$middleCoord,
+                                     avg_fitness = fitness_second_half$avg_fitness,
+                                     gene_category = fitness_second_half$geneCategory)
+  
+#predict corrected fitness for the second half of genome
+reversed_coordinates_second_half_df <- genomeLength - fitness_second_half_df$middle_coordinate
+predicted_fitness_second_half_df <- predict(lm_lin_coord, newdata = data.frame(middle_coordinate=reversed_coordinates_second_half_df, avg_fitness = fitness_second_half_df$avg_fitness ))
+fitness_second_half_df$corrected_fitness <- fitness_second_half_df$avg_fitness - predicted_fitness_second_half_df + 1
+
+
+#bind the two dataframes into one
+fitness_df_all <- rbind(fitness_first_half_df, fitness_second_half_df)
+
+#take out duplicates
+fitness_df_all <- fitness_df_all[!duplicated(fitness_df_all$middle_coordinate),]
+
+#create another column with the corrected gene category
+fitness_df_all$corrected_gene_category <- cut(fitness_df_all$corrected_fitness,
+                                              breaks = c(0, 0.96, 1.04, Inf),
+                                              labels = c("Disadvantageous", "Neutral", "Advantageous"))
+head(fitness_df_all,5)
+```
+
+Let's plot the fitness values before and after correction against the `middle_coordinate`.
+
+```{r linear model before and after correction, warning=FALSE, message=FALSE, fig.width=12, fig.height=5.5}
+color_categories_avg_fitness <- cut(fitness_df_all$avg_fitness, breaks = c(0, 0.96, 1.04, Inf), labels = c("Disadvantageous", "Neutral", "Advantageous"))
+
+color_categories_corrected_fitness <- cut(fitness_df_all$corrected_fitness, breaks = c(0, 0.96, 1.04, Inf), labels = c("Disadvantageous", "Neutral", "Advantageous"))
+
+ #create the scatterplot for avg_fitness in the obj not divided in windows
+plot_avg_fitness_df_all <- ggplot(fitness_df_all, aes(x = middle_coordinate, y = avg_fitness, color = color_categories_avg_fitness)) +
+  geom_point(size = 1)  +
+  geom_smooth(method = "density") +
+    geom_smooth(color='black') +  
+  scale_color_manual(values = color_palette,
+                     labels = c("Disadvantageous", "Neutral", "Advantageous"),
+                     guide = guide_legend(title = "Fitness Category")) +
+  ylim(0.7, 1.2) + 
+  labs(title = "Before fitness correction",
+       x = "middle_coordinate",
+       y = "avg_fitness")
+# Create the scatterplot for corrected_fitness in the obj not divided in windows
+plot_corrected_fitness_df_all <- ggplot(fitness_df_all, aes(x = middle_coordinate, y = corrected_fitness, color = color_categories_corrected_fitness)) +
+  geom_point(size = 1) +
+  geom_smooth(method = "density") +
+    geom_smooth(color='black')  + 
+    scale_color_manual(values = color_palette,
+                     labels = c("Disadvantageous", "Neutral", "Advantageous"),
+                     guide = guide_legend(title = "Fitness Category")) +
+  ylim(0.7, 1.2) + 
+  labs(title = "After fitness correction",
+       x = "middle_coordinate",
+       y = "corrected_fitness")
+
+# Arrange the plots side by side
+combined_plots <- grid.arrange(plot_avg_fitness_df_all, plot_corrected_fitness_df_all, ncol = 2)
+```
+
+The banana shape after fitness correction clearly disappears.
+
+Let's also plot a pie chart of the genes category before and after correction of fitness values. 
+
+```{r pie charts linear coord,warning=FALSE, message=FALSE, fig.width=12, fig.height=5.5}
+
+# Create the category counts
+gene_category_counts <- table(fitness_df_all$gene_category)
+corrected_gene_category_counts <- table(fitness_df_all$corrected_gene_category)
+
+# Combine the counts and categories into a data frame
+category_counts <- data.frame(Category = names(gene_category_counts),
+                              Count = as.numeric(gene_category_counts),
+                              Corrected_Count = as.numeric(corrected_gene_category_counts))
+
+# Calculate the percentages
+category_counts <- category_counts %>%
+  mutate(Percent = Count / sum(Count) * 100,
+         Corrected_Percent = Corrected_Count / sum(Corrected_Count) * 100)
+
+# Plot the pie chart for gene_category
+p_gene_category <- ggplot(category_counts, aes(x = "", y = Percent, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  theme(legend.position = "right", panel.background = element_rect(fill = "gray"),plot.title = element_text(hjust = 0.5, vjust = 2, size = 12, margin = margin(0, 0, 10, 0))) +
+  labs(title = "Gene Category - Before Correction") +
+  geom_text(aes(label = paste(round(Percent, 1), "%")), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("red", "yellow", "green"), breaks = c("Disadvantageous", "Neutral", "Advantageous"))
+
+
+# Plot the pie chart for corrected_gene_category
+p_corrected_gene_category <- ggplot(category_counts, aes(x = "", y = Corrected_Percent, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  theme(legend.position = "right", panel.background = element_rect(fill = "gray"),plot.title = element_text(hjust = 0.5, vjust = 2, size = 12, margin = margin(0, 0, 10, 0))) +
+  labs(title = "Gene Category - After Correction") +
+  geom_text(aes(label = paste(round(Corrected_Percent, 1), "%")), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("red", "yellow", "green"), breaks = c("Disadvantageous", "Neutral", "Advantageous"))
+
+
+# Display the combined pie charts
+grid.arrange(p_gene_category, p_corrected_gene_category, ncol = 2)
+
+```
+
+The number of Neutral locus after correction increases, instead the numbers of Disadvantageous and Advantageous decrease, especially the Advantageous once, proving again that before fitness correction many loci were misclassified. 
+
+## Radian coordinates
+
+When working with radians in a linear regression model, it's important to remember that radians represent angles in a circular or periodic context. To incorporate radians into the model, you can convert them to trigonometric functions such as sine and cosine.
+The `windows_properties` dataframe will be used.
+
+```{r radian coordinates sin and cos}
+
+windows_properties_rad <- windows_properties
+
+# Linear Regression model with sin and cos of radians as coefficients
+lm_rad_coord <- lm(formula = avg_fitness ~ sin(radians) + cos(radians), data= windows_properties_rad)
+summary(lm_rad_coord)
+
+# Linear Regression model with just cos of radians as coefficients
+lm_rad_coord_cos <- lm(formula = avg_fitness ~ cos(radians), data= windows_properties_rad)
+summary(lm_rad_coord_cos)
+```
+
+`sin(radians)` is not a significant coefficient, since its p-value > 0.05. At the contrary `cos(radians)` is significant, so a linear model without sin has been fitted as well. R-squared is slightly higher in the model containing also `sin(radians)`, so `lm_rad_coord` will be used for further analysis. Anyway, in both case R-squared is quite high , indicating that approximately 81% of the variance in fitness can be explained by the linear model considering the coordinates as radians.
+
+```{r predict radian}
+# Predict window fitness with rad coordinates
+predicted_fitness_rad <- predict(lm_rad_coord, windows_properties_rad)
+
+# Correct window fitness with rad coordinates
+windows_properties_rad$corrected_fitness <- windows_properties_rad$avg_fitness - predicted_fitness_rad + 1
+```
+
+Let's plot the scatterplot before and after fitness correction.
+
+```{r scatterplot windows before and after correction rad}
+# Create the scatterplot for avg_fitness
+plot_avg_fitness_rad <- ggplot(windows_properties_rad, aes(x = radians , y = avg_fitness)) +
+  geom_point(size = 2)  +
+  geom_smooth(method = "density") +
+    geom_smooth(color='blue') + 
+  ylim(0.9, 1.1) +  
+  labs(title = "Before fitness correction",
+       x = "rad_coordinate",
+       y = "avg_fitness")
+# Create the scatterplot for corrected_fitness
+plot_corrected_fitness_rad <- ggplot(windows_properties_rad, aes(x = radians, y = corrected_fitness)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "density") +
+    geom_smooth(color='blue')  + 
+  ylim(0.9, 1.1) + 
+  labs(title = "After fitness correction",
+       x = "rad_coordinate",
+       y = "corrected_fitness")
+
+# Arrange the plots side by side
+combined_plots <- grid.arrange(plot_avg_fitness_rad, plot_corrected_fitness_rad, ncol = 2)
+```
+
+The linear model with radian coordinates on the object divided in windows performs well, correcting the banana shape belonging to the plot without fitness correction.
+
+It can now be used to correct the fitness values in the original Grange object.
+
+```{r lm fitness obj radian }
+fitness_df_all_rad <- data.frame(radians = fitness$radianCoord,
+                                 avg_fitness = fitness$avg_fitness,
+                                 gene_category = fitness$geneCategory,
+                                 locus = names(fitness))
+# Correcting fitness values
+fitness_df_all_rad$corrected_fitness <- fitness_df_all_rad$avg_fitness - predict(lm_rad_coord, fitness_df_all_rad) + 1
+
+#create another column with the corrected gene category
+fitness_df_all_rad$corrected_gene_category <- cut(fitness_df_all_rad$corrected_fitness,
+                                              breaks = c(0, 0.96, 1.04, Inf),
+                                              labels = c("Disadvantageous", "Neutral", "Advantageous"))
+```
+
+Let's visualize 2 scatter plots of fitness values before and after correction against the `radians` coordinates.
+
+```{r linear model before and after correction rad, warning=FALSE, message=FALSE, fig.width=12, fig.height=5.5}
+color_categories_avg_fitness_rad <- cut(fitness_df_all_rad$avg_fitness, breaks = c(0, 0.96, 1.04, Inf), labels = c("Disadvantageous", "Neutral", "Advantageous"))
+
+color_categories_corrected_fitness_rad <- cut(fitness_df_all_rad$corrected_fitness, breaks = c(0, 0.96, 1.04, Inf), labels = c("Disadvantageous", "Neutral", "Advantageous"))
+
+ #create the scatterplot for avg_fitness in the obj not divided in windows
+plot_avg_fitness_df_all_rad <- ggplot(fitness_df_all_rad, aes(x = radians, y = avg_fitness, color = color_categories_avg_fitness_rad)) +
+  geom_point(size = 1)  +
+  geom_smooth(method = "density") +
+    geom_smooth(color='black') +  
+  scale_color_manual(values = color_palette,
+                     labels = c("Disadvantageous", "Neutral", "Advantageous"),
+                     guide = guide_legend(title = "Fitness Category")) +
+  ylim(0.7, 1.2) + 
+  labs(title = "Before fitness correction",
+       x = "rad_coordinate",
+       y = "avg_fitness")
+# Create the scatterplot for corrected_fitness in the obj not divided in windows
+plot_corrected_fitness_df_all_rad <- ggplot(fitness_df_all_rad, aes(x = radians, y = corrected_fitness, color = color_categories_corrected_fitness_rad)) +
+  geom_point(size = 1) +
+  geom_smooth(method = "density") +
+    geom_smooth(color='black')  + 
+    scale_color_manual(values = color_palette,
+                     labels = c("Disadvantageous", "Neutral", "Advantageous"),
+                     guide = guide_legend(title = "Fitness Category")) +
+  ylim(0.7, 1.2) + 
+  labs(title = "After fitness correction",
+       x = "rad_coordinate",
+       y = "corrected_fitness")
+
+# Arrange the plots side by side
+combined_plots_rad <- grid.arrange(plot_avg_fitness_df_all_rad, plot_corrected_fitness_df_all_rad, ncol = 2)
+```
+
+Let's also visualize the Gene category change before and after fitness values correction.
+
+```{r pie charts rad model,warning=FALSE, message=FALSE, fig.width=12, fig.height=5.5}
+
+# Create the category counts
+gene_category_counts_rad <- table(fitness_df_all_rad$gene_category)
+corrected_gene_category_counts_rad <- table(fitness_df_all_rad$corrected_gene_category)
+
+# Combine the counts and categories into a data frame
+category_counts_rad <- data.frame(Category = names(gene_category_counts_rad),
+                              Count = as.numeric(gene_category_counts_rad),
+                              Corrected_Count = as.numeric(corrected_gene_category_counts_rad))
+
+# Calculate the percentages
+category_counts_rad <- category_counts_rad %>%
+  mutate(Percent = Count / sum(Count) * 100,
+         Corrected_Percent = Corrected_Count / sum(Corrected_Count) * 100)
+
+# Plot the pie chart for gene_category
+p_gene_category_rad <- ggplot(category_counts_rad, aes(x = "", y = Percent, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  theme(legend.position = "right", panel.background = element_rect(fill = "gray"),plot.title = element_text(hjust = 0.5, vjust = 2, size = 12, margin = margin(0, 0, 10, 0))) +
+  labs(title = "Gene Category - Before Correction") +
+  geom_text(aes(label = paste(round(Percent, 1), "%")), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("red", "yellow", "green"), breaks = c("Disadvantageous", "Neutral", "Advantageous"))
+
+
+# Plot the pie chart for corrected_gene_category
+p_corrected_gene_category_rad <- ggplot(category_counts_rad, aes(x = "", y = Corrected_Percent, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  theme(legend.position = "right", panel.background = element_rect(fill = "gray"),plot.title = element_text(hjust = 0.5, vjust = 2, size = 12, margin = margin(0, 0, 10, 0))) +
+  labs(title = "Gene Category - After Correction") +
+  geom_text(aes(label = paste(round(Corrected_Percent, 1), "%")), position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("red", "yellow", "green"), breaks = c("Disadvantageous", "Neutral", "Advantageous"))
+
+
+# Display the combined pie charts
+grid.arrange(p_gene_category_rad, p_corrected_gene_category_rad, ncol = 2)
+
+```
+The banana shape is corrected totally. 
+Compared to the linear model with linear coordinates, the model with radian coordinates classifies as "Neutral" and "Disadvantageous" 0.2% more loci. At the same time "Advantageous" loci after correction have decreased even more by 0.3%.
+
+### Gene category transition
+
+In order to visualize the gene category transition before and after fitness correction a stacked barplot has been used.
+
+```{r stacked barplot, fig.width=10, fig.height=6.5}
+# Calculate the transition counts
+transition_counts <- table(fitness_df_all_rad$gene_category, fitness_df_all_rad$corrected_gene_category)
+
+# Reshape the data for plotting
+transition_df <- as.data.frame.table(transition_counts)
+
+# Plot the transitions
+ggplot(transition_df, aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = Freq), position = position_stack(vjust = 0.5), color = "black", size = 3) +
+  xlab("Gene Category before correction") +
+  ylab("Count") +
+  labs(fill = "Corrected Gene Category") +
+  scale_fill_manual(values = c("Advantageous" = "green", "Neutral" = "yellow", "Disadvantageous" = "red")) +
+  ggtitle("Gene Category Transitions")
+```
+
+After fitness correction, 30 loci have changed from Disadvantageous to Neutral, 36 loci have changed from Neutral to Advantageous and 25 to Disadvantageous, and 116 loci have changed from Advantageous to Neutral.
+
+# Gene ontology annotation 
+
+It's interesting to check the GO biological process of the loci that where categorized as "Neutral" before the correction, and were categorized as either "Advantageous" or "Disadvantageous" after fitness correction, because they might have a critical role in cell survival.
+
+The loci names have been saved to two different txt file based on if they were categorized as "Advantageous" or "Disadvantageous" after correction. The txts were given as input to [UniProt](https://www.uniprot.org/) online tool. The results (loci names + biological process ) were then saved into two excel files and loaded back in the vignette as dataframes.
+
+```{r uniprot txt files }
+
+# Filter the dataframe based on the conditions
+filtered_df_adv <- fitness_df_all_rad[fitness_df_all_rad$gene_category == "Neutral" &
+                                  (fitness_df_all_rad$corrected_gene_category == "Advantageous"), ]
+filtered_df_dis <- fitness_df_all_rad[fitness_df_all_rad$gene_category == "Neutral" &
+                                  (fitness_df_all_rad$corrected_gene_category == "Disadvantageous"), ]
+# Get the locus column names from the filtered dataframes
+locus_names_adv <- filtered_df_adv$locus
+locus_names_dis <- filtered_df_dis$locus
+
+# Create two character vectors with whitespace-separated names
+locus_names_string_adv <- paste(locus_names_adv, collapse = " ")
+locus_names_string_dis <- paste(locus_names_dis, collapse = " ")
+
+# Save the locus names to a text file
+
+writeLines(locus_names_string_adv, "locus_names_adv.txt")
+writeLines(locus_names_string_dis, "locus_names_dis.txt")
+
+library(readxl)
+
+df_adv <- read_excel("uniprot-download_adv.xlsx", col_names = TRUE)
+df_adv <- df_adv[, c(1,3)]
+
+df_dis <- read_excel("uniprot-download_dis.xlsx", col_names = TRUE)
+df_dis <- df_dis[, c(1,3)]
+
+
+```
+
+The biological processes among genes that were categorized as "Neutral", and that after fitness connection were categorized as "Advantageous", are listed below:
+
+```{r 10 most common biological processes adv}
+# Split the strings by semicolon and create a list of all the strings
+all_strings_adv <- strsplit(df_adv$`Gene Ontology (biological process)`, ";")
+
+# Flatten the list into a single vector
+all_strings_adv <- unlist(all_strings_adv)
+
+# Remove leading and trailing white spaces from the strings
+all_strings_adv <- trimws(all_strings_adv)
+
+# Count the frequency of each string
+string_counts_adv <- table(all_strings_adv)
+
+string_counts_adv
+
+```
+
+Some of the biological processes listed above relate to cellular response against stress, such as protein repair, responsiveness towards oxidative stress, nucleotide-excision repair, removal of superoxide radicals and SOS response. It can be guessed that removal of genes with these particular biological processes could result in bacterium's inability to trigger a reaction for avoiding the impact of stressful circumstances on cell survival; or the apoptosis resulting from stress situations might not occur leading to enhanced fitness.
+
+The biological processes among genes that were categorized as "Neutral", and that after fitness connection were categorized as "Disadvantageous", are listed below:
+
+```{r 10 most common biological process dis}
+# Split the strings by semicolon and create a list of all the strings
+all_strings_dis <- strsplit(df_dis$`Gene Ontology (biological process)`, ";")
+
+# Flatten the list into a single vector
+all_strings_dis <- unlist(all_strings_dis)
+
+# Remove leading and trailing white spaces from the strings
+all_strings_dis <- trimws(all_strings_dis)
+
+# Count the frequency of each string
+string_counts_dis <- table(all_strings_dis)
+
+string_counts_dis
+
+```
+
+Many biological processes listed above refer to metabolic processes and processes essential for cell life, such as DNA replication, cell division and protein folding. So a mutation in genes with these biological processes might be crucial for cell survival. 
+
+# Conclusion
+
+Using both linear and radian coordinates as coefficients in order to correct fitness values in a linear regression model was successful. 
+
+The model with radian coordinates performed slightly better, correcting the banana shape totally. This allowed to correct fitness of genes that were misclassified as 'Advantageous', 'Disadvantageous' or 'Neutral'.
+
+By annotating the loci that were wrongly classified as 'Neutral' it was possible to retrieve the biological processes of genes that might have a critical role in cell survival.
+
+# Session info
+
+```{r, session-info, echo=FALSE}
+print(sessionInfo(), nrow=(1000))
+```
